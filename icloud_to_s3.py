@@ -22,6 +22,8 @@ import sys
 import logging
 import hashlib
 import tempfile
+import argparse
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Set, Dict, Any
@@ -44,13 +46,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class iCloudS3Sync:
-    def __init__(self, storage_class: str):
+    def __init__(self, storage_class: str, local_path: Optional[str] = None):
         self.icloud = None
         self.s3_client = None
         self.bucket_name = None
         self.processed_files: Set[str] = set()
         self.state_file = "sync_state.json"
         self.storage_class = storage_class
+        self.local_path = local_path
+        
+        # Create local directory if specified
+        if self.local_path:
+            os.makedirs(self.local_path, exist_ok=True)
+            logger.info(f"Local backup directory: {self.local_path}")
+        
+        logger.info(f"Initialized with S3 storage class: {storage_class}")
         
     def setup_icloud(self, username: str, password: str) -> bool:
         """Initialize iCloud connection with 2FA support."""
@@ -169,12 +179,23 @@ class iCloudS3Sync:
         return hash_md5.hexdigest()
     
     def file_exists_in_s3(self, s3_key: str, local_hash: str) -> bool:
-        """Check if file exists in S3 with same content."""
+        """Check if file exists in S3 with same content (handles DeepArchive)."""
         try:
             response = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
             s3_etag = response.get('ETag', '').strip('"')
-            # ETag might be MD5 hash for simple uploads
+            storage_class = response.get('StorageClass', 'STANDARD')
+            
+            logger.debug(f"S3 object {s3_key}: StorageClass={storage_class}, ETag={s3_etag}")
+            
+            # For DeepArchive or Glacier, we mainly check if the object exists
+            # ETag comparison might not work perfectly with multipart uploads
+            if storage_class in ['DEEP_ARCHIVE', 'GLACIER']:
+                logger.debug(f"File {s3_key} exists in {storage_class} - skipping")
+                return True
+            
+            # For other storage classes, compare ETag (might be MD5 hash)
             return s3_etag == local_hash
+            
         except ClientError as e:
             if e.response['Error']['Code'] == '404':
                 return False
@@ -183,13 +204,16 @@ class iCloudS3Sync:
                 return False
     
     def upload_to_s3(self, local_path: str, s3_key: str, metadata: Dict[str, str] = None) -> bool:
-        """Upload file to S3."""
+        """Upload file to S3 with specified storage class."""
         try:
-            extra_args = {'ContentType': self.get_content_type(local_path)}
-            if self.storage_class:
-                extra_args['StorageClass'] = self.storage_class
+            extra_args = {
+                'ContentType': self.get_content_type(local_path),
+                'StorageClass': self.storage_class
+            }
             if metadata:
                 extra_args['Metadata'] = metadata
+            
+            logger.debug(f"Uploading with StorageClass: {self.storage_class}")
             
             self.s3_client.upload_file(
                 local_path, 
@@ -197,7 +221,7 @@ class iCloudS3Sync:
                 s3_key,
                 ExtraArgs=extra_args
             )
-            logger.info(f"Uploaded: {s3_key}")
+            logger.info(f"Uploaded to {self.storage_class}: {s3_key}")
             return True
             
         except Exception as e:
@@ -241,6 +265,39 @@ class iCloudS3Sync:
         
         return s3_key
     
+    def copy_to_local(self, temp_file: str, filename: str, created_date: Optional[datetime] = None) -> bool:
+        """Copy file to local backup directory with same folder structure as S3."""
+        if not self.local_path:
+            return True
+            
+        try:
+            # Create same folder structure as S3
+            if created_date:
+                year = created_date.year
+                month = f"{created_date.month:02d}"
+                local_dir = os.path.join(self.local_path, "photos", str(year), month)
+            else:
+                local_dir = os.path.join(self.local_path, "photos", "unknown_date")
+            
+            # Create directory if it doesn't exist
+            os.makedirs(local_dir, exist_ok=True)
+            
+            # Copy file to local directory
+            local_file_path = os.path.join(local_dir, filename)
+            
+            # Skip if file already exists locally
+            if os.path.exists(local_file_path):
+                logger.debug(f"File already exists locally: {local_file_path}")
+                return True
+            
+            shutil.copy2(temp_file, local_file_path)
+            logger.info(f"Saved locally: {local_file_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save {filename} locally: {e}")
+            return False
+    
     def download_and_upload_photo(self, photo, temp_dir: str) -> bool:
         """Download photo from iCloud and upload to S3."""
         try:
@@ -276,10 +333,22 @@ class iCloudS3Sync:
             # Generate S3 key
             s3_key = self.generate_s3_key(photo, filename)
             
+            # Get created date for local storage
+            created_date = None
+            if hasattr(photo, 'created'):
+                created_date = photo.created
+            elif hasattr(photo, 'asset_date'):
+                created_date = photo.asset_date
+            
             # Check if file already exists in S3
             if self.file_exists_in_s3(s3_key, file_hash):
                 logger.info(f"File already exists in S3: {s3_key}")
                 self.processed_files.add(photo_id)
+                
+                # Still save locally if requested and doesn't exist
+                if self.local_path:
+                    self.copy_to_local(temp_file, filename, created_date)
+                
                 os.remove(temp_file)
                 return True
             
@@ -291,17 +360,24 @@ class iCloudS3Sync:
                 'upload-date': datetime.now().isoformat()
             }
             
-            if hasattr(photo, 'created'):
-                metadata['created-date'] = photo.created.isoformat()
+            if created_date:
+                metadata['created-date'] = created_date.isoformat()
             
             # Upload to S3
-            if self.upload_to_s3(temp_file, s3_key, metadata):
+            upload_success = self.upload_to_s3(temp_file, s3_key, metadata)
+            
+            # Save locally if requested
+            local_success = True
+            if self.local_path:
+                local_success = self.copy_to_local(temp_file, filename, created_date)
+            
+            if upload_success:
                 self.processed_files.add(photo_id)
                 logger.info(f"Successfully synced: {filename} -> {s3_key}")
                 
             # Clean up temporary file
             os.remove(temp_file)
-            return True
+            return upload_success and local_success
             
         except Exception as e:
             logger.error(f"Error processing photo {filename}: {e}")
@@ -372,37 +448,147 @@ class iCloudS3Sync:
         return stats
 
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Sync iCloud Photos to AWS S3",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --test 10                           # Test with 10 photos
+  %(prog)s --local-backup ./photos             # Keep local backup in ./photos
+  %(prog)s --storage-class GLACIER             # Use Glacier storage
+  %(prog)s --local-backup ~/backup --test 50   # Test 50 photos with local backup
+  
+Environment Variables:
+  ICLOUD_USERNAME      Your iCloud username/email
+  ICLOUD_PASSWORD      Your iCloud password
+  AWS_ACCESS_KEY_ID    AWS access key
+  AWS_SECRET_ACCESS_KEY AWS secret key  
+  AWS_REGION           AWS region (default: us-east-1)
+  S3_BUCKET_NAME       Target S3 bucket name
+  S3_STORAGE_CLASS     S3 storage class (default: DEEP_ARCHIVE)
+        """
+    )
+    
+    parser.add_argument(
+        '--local-backup', '--local', '-l',
+        type=str,
+        metavar='PATH',
+        help='Directory to keep local backup of photos (creates same folder structure as S3)'
+    )
+    
+    parser.add_argument(
+        '--storage-class', '-s',
+        type=str,
+        choices=['STANDARD', 'REDUCED_REDUNDANCY', 'STANDARD_IA', 'ONEZONE_IA', 'INTELLIGENT_TIERING', 'GLACIER', 'DEEP_ARCHIVE'],
+        default=None,
+        help='S3 storage class (default: DEEP_ARCHIVE, or from S3_STORAGE_CLASS env var)'
+    )
+    
+    parser.add_argument(
+        '--test', '-t',
+        type=int,
+        metavar='N',
+        help='Test mode: process only N photos'
+    )
+    
+    parser.add_argument(
+        '--bucket', '-b',
+        type=str,
+        metavar='BUCKET',
+        help='S3 bucket name (overrides S3_BUCKET_NAME env var)'
+    )
+    
+    parser.add_argument(
+        '--region', '-r',
+        type=str,
+        metavar='REGION',
+        default='us-east-1',
+        help='AWS region (default: us-east-1)'
+    )
+    
+    parser.add_argument(
+        '--skip-prompt',
+        action='store_true',
+        help='Skip interactive prompts (use env vars or fail)'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Set logging level (default: INFO)'
+    )
+    
+    return parser.parse_args()
+
+
 def main():
     """Main function to run the sync."""
     
-    # Get configuration from environment variables
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Set logging level
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    
+    # Get configuration from environment variables and command line args
     icloud_username = os.getenv('ICLOUD_USERNAME')
     icloud_password = os.getenv('ICLOUD_PASSWORD')
     aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
     aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-    aws_region = os.getenv('AWS_REGION', 'us-east-1')
-    s3_bucket = os.getenv('S3_BUCKET_NAME')
-    storage_class = os.getenv('S3_STORAGE_CLASS', 'DEEP_ARCHIVE')
+    aws_region = args.region or os.getenv('AWS_REGION', 'us-east-1')
+    s3_bucket = args.bucket or os.getenv('S3_BUCKET_NAME')
+    storage_class = args.storage_class or os.getenv('S3_STORAGE_CLASS', 'DEEP_ARCHIVE')
     
-    # Prompt for missing credentials
-    if not icloud_username:
-        icloud_username = input("Enter iCloud username/email: ")
+    # Prompt for missing credentials if not skipping prompts
+    if not args.skip_prompt:
+        if not icloud_username:
+            icloud_username = input("Enter iCloud username/email: ")
+        
+        if not icloud_password:
+            import getpass
+            icloud_password = getpass.getpass("Enter iCloud password: ")
+        
+        if not s3_bucket:
+            s3_bucket = input("Enter S3 bucket name: ")
     
-    if not icloud_password:
-        import getpass
-        icloud_password = getpass.getpass("Enter iCloud password: ")
+    # Validate required parameters
+    if not icloud_username or not icloud_password or not s3_bucket:
+        logger.error("Missing required parameters. Use --help for more information.")
+        return 1
     
-    if not s3_bucket:
-        s3_bucket = input("Enter S3 bucket name: ")
+    # Show configuration
+    print(f"\n{'='*60}")
+    print(f"iCloud to S3 Sync Configuration")
+    print(f"{'='*60}")
+    print(f"📦 S3 Storage Class: {storage_class}")
+    print(f"🪣 S3 Bucket: {s3_bucket}")
+    print(f"🌍 AWS Region: {aws_region}")
     
-    # Show storage class info
-    print(f"\n📦 Using S3 Storage Class: {storage_class}")
+    if args.local_backup:
+        print(f"💾 Local Backup: {os.path.abspath(args.local_backup)}")
+    else:
+        print(f"💾 Local Backup: Disabled")
+    
+    if args.test:
+        print(f"🧪 Test Mode: Processing {args.test} photos only")
+    else:
+        print(f"🚀 Full Sync: Processing all photos")
+    
+    # Storage class info
     if storage_class == 'DEEP_ARCHIVE':
         print("💡 DeepArchive is the most cost-effective for long-term storage")
         print("⚠️  Note: Files in DeepArchive take 12+ hours to retrieve")
+    elif storage_class == 'GLACIER':
+        print("💡 Glacier provides good cost savings with faster retrieval than DeepArchive")
+        print("⚠️  Note: Files in Glacier take 1-5 minutes to retrieve")
     
-    # Create sync instance with specified storage class
-    sync = iCloudS3Sync(storage_class)
+    print(f"{'='*60}\n")
+    
+    # Create sync instance with specified options
+    sync = iCloudS3Sync(storage_class, args.local_backup)
     
     # Setup iCloud
     if not sync.setup_icloud(icloud_username, icloud_password):
@@ -415,11 +601,11 @@ def main():
         return 1
     
     try:
-        max_photos = None
-        # Ask if user wants to limit the number of photos for testing
-        if os.getenv('SKIP_TEST'):
-            test_run = False
-        else:
+        # Use test mode if specified
+        max_photos = args.test
+        
+        # Interactive test mode if not specified via args and not skipping prompts
+        if not max_photos and not args.skip_prompt:
             test_run = input("Do you want to run a test with limited photos? (y/n): ").lower() == 'y'
             if test_run:
                 max_photos = int(input("Enter number of photos to process (default 10): ") or "10")
@@ -435,6 +621,9 @@ def main():
         print(f"Uploaded to S3: {stats['uploaded']}")
         print(f"Skipped (already exists): {stats['skipped']}")
         print(f"Errors: {stats['errors']}")
+        
+        if args.local_backup:
+            print(f"📁 Local backup saved to: {os.path.abspath(args.local_backup)}")
         
         return 0
         
